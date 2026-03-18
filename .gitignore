@@ -41,3 +41,9 @@ go.work.sum
 
 #
 *.bin
+/.idea/.gitignore
+/.idea/encodings.xml
+/.idea/go.imports.xml
+/.idea/modules.xml
+/.idea/Parser.iml
+/.idea/vcs.xml
