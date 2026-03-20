@@ -2,4 +2,7 @@ module Parser
 
 go 1.26.1
 
-require github.com/ulikunitz/xz v0.5.15 // indirect
+require (
+	github.com/ulikunitz/xz v0.5.15 // indirect
+	golang.org/x/sys v0.42.0 // indirect
+)
