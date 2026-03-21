@@ -90,6 +90,13 @@ type BasicSymlink struct {
 	Target        []uint8
 }
 
+type ExtendedSymlink struct {
+	HardLinkCount uint32
+	TargetSize    uint32
+	TargetPath    []uint8
+	XattrIdx      uint32
+}
+
 type ExtendedFile struct {
 	BlocksStart        uint64
 	FileSize           uint64
@@ -424,6 +431,25 @@ func decodeInodes(squash *SquashFS, inodeData []byte) {
 			offset += consumed
 
 			squash.Inodes = append(squash.Inodes, InodePair{Header: inodeHeader, Body: extDir})
+
+		case 10: // Extended Symlink
+			r := bytes.NewReader(inodeData[offset:])
+			var s ExtendedSymlink
+			binary.Read(r, binary.LittleEndian, &s.HardLinkCount)
+			binary.Read(r, binary.LittleEndian, &s.TargetSize)
+
+			s.TargetPath = make([]uint8, s.TargetSize)
+
+			binary.Read(r, binary.LittleEndian, &s.TargetPath)
+			binary.Read(r, binary.LittleEndian, &s.XattrIdx)
+			offset += 12 + uint64(s.TargetSize)
+			squash.Inodes = append(squash.Inodes, InodePair{Header: inodeHeader, Body: &s})
+
+		default:
+			fmt.Printf(
+				"  [inodes] WARNING: unknown inode type %d at offset=0x%X inode=%d, stopping\n",
+				inodeHeader.InodeType, offset-16, i,
+			)
 		}
 	}
 
@@ -609,7 +635,6 @@ func decodeIDTable(squash *SquashFS, idData []byte) {
 
 // Here, data is just the entire byte array, not relative to any position
 func decodeXattrTable(squash *SquashFS, data []byte, xattrTableStart uint64) {
-	// Parse XattrIDTable
 	xattrIDTable := XattrIDTable{
 		XattrTableStart: binary.LittleEndian.Uint64(data[xattrTableStart : xattrTableStart+8]),
 		XattrIds:        binary.LittleEndian.Uint32(data[xattrTableStart+8 : xattrTableStart+12]),
@@ -623,11 +648,6 @@ func decodeXattrTable(squash *SquashFS, data []byte, xattrTableStart uint64) {
 		ptr += squash.Base
 		xattrIDTable.Table = append(xattrIDTable.Table, ptr)
 	}
-
-	// Parse XattrLookupTable entries
-	//lookupBlockHeader := binary.LittleEndian.Uint16(data[xattrIDTable.Table[0] : xattrIDTable.Table[0]+2])
-	//lookupBlockSize := uint64(lookupBlockHeader & 0x7FFF)
-	//lookupData := data[xattrIDTable.Table[0]+2 : xattrIDTable.Table[0]+2+lookupBlockSize]
 
 	lookupData := readSquashFSMetadataBlocks(
 		xattrIDTable.Table[0],
@@ -645,14 +665,15 @@ func decodeXattrTable(squash *SquashFS, data []byte, xattrTableStart uint64) {
 		})
 	}
 
-	// Parse KV metadata block
-	//kvBlockHeader := binary.LittleEndian.Uint16(data[xattrIDTable.XattrTableStart : xattrIDTable.XattrTableStart+2])
-	//kvBlockSize := uint64(kvBlockHeader & 0x7FFF)
-	//kvData := data[xattrIDTable.XattrTableStart+2 : xattrIDTable.XattrTableStart+2+kvBlockSize]
+	fmt.Printf("  [xattr] XattrTableStart=0x%X Table[0]=0x%X xattrTableStart=0x%X\n",
+		xattrIDTable.XattrTableStart,
+		xattrIDTable.Table[0],
+		xattrTableStart,
+	)
 
 	kvData := readSquashFSMetadataBlocks(
 		xattrIDTable.XattrTableStart,
-		xattrTableStart,
+		xattrIDTable.Table[0], // end at the lookup table, not the ID table header
 		data,
 	)
 
@@ -671,6 +692,12 @@ func decodeXattrTable(squash *SquashFS, data []byte, xattrTableStart uint64) {
 			nameSize := binary.LittleEndian.Uint16(kvData[pos+2 : pos+4])
 			pos += 4
 
+			if pos+uint64(nameSize) > uint64(len(kvData)) {
+				fmt.Printf("  [xattr] out of bounds reading key name at pos=0x%X nameSize=%d len=%d\n",
+					pos, nameSize, len(kvData))
+				break
+			}
+
 			key := XattrKeyEntry{
 				Type:     keyType,
 				NameSize: nameSize,
@@ -678,9 +705,18 @@ func decodeXattrTable(squash *SquashFS, data []byte, xattrTableStart uint64) {
 			}
 			pos += uint64(nameSize)
 
+			if pos+4 > uint64(len(kvData)) {
+				fmt.Printf("  [xattr] out of bounds reading value size at pos=0x%X\n", pos)
+				break
+			}
 			valueSize := binary.LittleEndian.Uint32(kvData[pos : pos+4])
 			pos += 4
 
+			if pos+uint64(valueSize) > uint64(len(kvData)) {
+				fmt.Printf("  [xattr] out of bounds reading value at pos=0x%X valueSize=%d len=%d\n",
+					pos, valueSize, len(kvData))
+				break
+			}
 			value := XattrValueEntry{
 				ValueSize: valueSize,
 				Value:     kvData[pos : pos+uint64(valueSize)],
@@ -751,14 +787,12 @@ func extractFiles(squash *SquashFS, data []byte, outputDir string) error {
 			cur = parent
 		}
 
-		// Reverse: parts are leaf→root, we want root→leaf
 		for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
 			parts[i], parts[j] = parts[j], parts[i]
 		}
 
 		relPath := filepath.Join(parts...)
 		if relPath == "" {
-			// Root directory itself — skip
 			continue
 		}
 		outPath := filepath.Join(outputDir, relPath)
@@ -959,6 +993,12 @@ func extractFiles(squash *SquashFS, data []byte, outputDir string) error {
 
 			if err := os.Symlink(string(body.Target), outPath); err != nil {
 				// Don't fatal — symlinks may already exist or target may be missing
+				fmt.Printf("  WARNING: symlink failed for %s: %v\n", relPath, err)
+			}
+
+		case *ExtendedSymlink:
+			fmt.Printf("Extracting extended symlink %s -> %s\n", relPath, string(body.TargetPath))
+			if err := os.Symlink(string(body.TargetPath), outPath); err != nil {
 				fmt.Printf("  WARNING: symlink failed for %s: %v\n", relPath, err)
 			}
 

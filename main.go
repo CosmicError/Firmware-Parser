@@ -16,13 +16,19 @@ import (
 )
 
 type FirmwareFile struct {
-	StartHeader    *StartHeader
-	FirmwareHeader *FirmwareHeader
+	//StartHeader    *StartHeader
+	//FirmwareHeader *FirmwareHeader
 
-	// SquashFS
-	// Start: 0x027DCEB8
+	Live    *FirmwareSection
+	Upgrade *FirmwareSection
+	MBR     []byte
+
 	MainFS *SquashFS
-	// End: 0x311B2EB8
+}
+
+type FirmwareSection struct {
+	Header *StartHeader
+	Meta   *MetaDataBlock
 }
 
 type StartHeader struct {
@@ -224,20 +230,20 @@ func printFirmwareFile(file *FirmwareFile) {
 	fmt.Println("\n=== Firmware File ===")
 
 	fmt.Println("\n--- Start Header ---")
-	fmt.Printf("  Magic:             0x%08X\n", file.StartHeader.Magic)
-	fmt.Printf("  Firmware Header:   0x%08X\n", file.StartHeader.FirmwareHeader)
-	fmt.Printf("  UnknownB:          0x%08X\n", file.StartHeader.UnknownB)
-	fmt.Printf("  Flags:             0x%08X\n", file.StartHeader.Flags)
-	fmt.Printf("  File System:       0x%08X\n", file.StartHeader.FileSystemHeader)
-	fmt.Printf("  File End:          0x%08X\n", file.StartHeader.FileEnd)
+	fmt.Printf("  Magic:             0x%08X\n", file.Live.Header.Magic)
+	fmt.Printf("  Firmware Header:   0x%08X\n", file.Live.Header.FirmwareHeader)
+	fmt.Printf("  UnknownB:          0x%08X\n", file.Live.Header.UnknownB)
+	fmt.Printf("  Flags:             0x%08X\n", file.Live.Header.Flags)
+	fmt.Printf("  File System:       0x%08X\n", file.Live.Header.FileSystemHeader)
+	fmt.Printf("  File End:          0x%08X\n", file.Live.Header.FileEnd)
 
 	fmt.Println("\n--- Firmware Header ---")
-	fmt.Printf("  Magic:             0x%08X\n", file.FirmwareHeader.Magic)
-	fmt.Printf("  UnknownA:          0x%08X\n", file.FirmwareHeader.UnknownA)
-	fmt.Printf("  UnknownB:          0x%08X\n", file.FirmwareHeader.UnknownB)
-	fmt.Printf("  UnknownC:          0x%08X\n", file.FirmwareHeader.UnknownC)
-	fmt.Printf("  KernelStart:          0x%08X\n", file.FirmwareHeader.KernelStart)
-	fmt.Printf("  UnknownE:          0x%08X\n", file.FirmwareHeader.UnknownE)
+	fmt.Printf("  Magic:             0x%08X\n", file.Upgrade.Header.Magic)
+	fmt.Printf("  UnknownA:          0x%08X\n", file.Upgrade.Header.FirmwareHeader)
+	fmt.Printf("  UnknownB:          0x%08X\n", file.Upgrade.Header.UnknownB)
+	fmt.Printf("  UnknownC:          0x%08X\n", file.Upgrade.Header.Flags)
+	fmt.Printf("  KernelStart:       0x%08X\n", file.Upgrade.Header.FileSystemHeader)
+	fmt.Printf("  UnknownE:          0x%08X\n", file.Upgrade.Header.FileEnd)
 
 	fmt.Println("\n--- Squashfs Header ---")
 	fmt.Printf("  Magic:             0x%08X\n", file.MainFS.Header.Magic)
@@ -371,14 +377,17 @@ func main() {
 	// Only started 3 hours after the interview, so 8pm. Finished the day at 12am
 
 	// Where all the parsed results will live
-	file := FirmwareFile{}
+	file := FirmwareFile{
+		Live:    &FirmwareSection{},
+		Upgrade: &FirmwareSection{},
+	}
 
-	file.StartHeader = fill[StartHeader](data, 0x0, binary.BigEndian) // End @ 0x8C
+	file.Live.Header = fill[StartHeader](data, 0x0, binary.BigEndian) // End @ 0x8C
 	startHeaderSize := uint32(binary.Size(StartHeader{}))
 
-	metaDataBlockA := parseMetaData(startHeaderSize, file.StartHeader.FirmwareHeader, data)
+	metaDataBlockA := parseMetaData(startHeaderSize, file.Live.Header.FirmwareHeader, data)
 
-	file.FirmwareHeader = fill[FirmwareHeader](data, uint64(file.StartHeader.FirmwareHeader), binary.BigEndian)
+	file.Upgrade.Header = fill[StartHeader](data, uint64(file.Live.Header.FirmwareHeader), binary.BigEndian)
 	firmwareHeaderASize := uint32(binary.Size(FirmwareHeader{}))
 
 	parseMetaData(metaDataBlockA.End+firmwareHeaderASize, 0x80E, data)
@@ -409,7 +418,7 @@ func main() {
 
 	// Finish Squashfs Parsing
 
-	file.MainFS, err = parseSquashFS(data, uint64(file.StartHeader.FileSystemHeader))
+	file.MainFS, err = parseSquashFS(data, uint64(file.Live.Header.FileSystemHeader))
 	if err != nil {
 		fmt.Printf("parseSquashFS error: %v\n", err)
 		os.Exit(1)
@@ -433,6 +442,7 @@ func main() {
 
 	// ==============================================
 
+	printFirmwareFile(&file)
 	mapped.Close()
 	data = nil
 	file.MainFS = nil
@@ -499,5 +509,19 @@ func main() {
 		pkgSquash = nil
 	}
 
-	//printFirmwareFile(&file)
+	// ===========================================
+	//                  DAY 5
+	// ===========================================
+
+	// Going back to the initial headers now that i know how it's actually structured from the
+	//experience from unpacking the other .pkg files.
+
+	// Live Start Header
+	// Backup Start Header
+	// Bootloader
+	// Kernel
+	// FileSystem
+
+	// Hopefully this should also be pretty easy like day 3 and kinda like day 4 since i already know the info,
+	// I just need to code it
 }
