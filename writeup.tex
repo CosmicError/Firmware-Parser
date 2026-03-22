@@ -1,0 +1,562 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{fontenc}
+\usepackage{inputenc}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+}
+
+\lstdefinestyle{hexstyle}{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!10},
+    rulecolor=\color{gray!40},
+    xleftmargin=1em,
+    xrightmargin=1em,
+}
+
+\lstdefinestyle{gostyle}{
+    language=C, % close enough for syntax highlighting
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{orange},
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!10},
+    rulecolor=\color{gray!40},
+    xleftmargin=1em,
+    xrightmargin=1em,
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{Firmware Image Analysis}
+\lhead{}
+\rfoot{Page \thepage}
+
+\title{Firmware Image Analysis}
+\author{}
+\date{March 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ==============================================================
+\section{Overview}
+
+This document describes the structure of the firmware images analyzed, the
+approach taken to parse them, and how every byte region is accounted for.
+The parser is written in Go and walks the image structurally, the same
+way a bootloader would, rather than scanning for magic bytes.
+
+% ==============================================================
+\section{Tooling and AI Usage}
+
+The parser was written over approximately five days of part-time work. AI
+(Claude) was used in the following ways:
+
+\begin{itemize}
+    \item \textbf{Boilerplate generation} for repetitive struct parsing
+        (e.g.\ the \texttt{binary.Read} sequences for inode types). The
+        pattern was established manually; AI accelerated writing similar
+        blocks.
+
+    \item \textbf{Language gap filling}, the underlying systems
+        programming concepts were already understood, but Go-specific
+        idioms and simple go language functions required lookup at the start (first time using Go).
+
+    \item \textbf{Struct scaffolding} for the \texttt{printFirmwareFile}
+        function, to complete the menial work of printing out every attribute in a structure.
+          
+    \item \textbf{Write-up organization} for this document. The format
+      	internals are well understood and I can answer questions about any
+      	of it, but translating that into structured writing is a weaker
+      	area. AI provided a starting framework that I then edited and
+      	refined until satisfied.
+    
+    \item \textbf{Magic byte identification} during early reconnaissance.
+      	I had not used binwalk before and initially preferred working with
+      	tools I was already comfortable with. AI helped identify known
+      	signatures directly in hex before I eventually adopted binwalk
+      	as well.
+    
+	\item \textbf{Bouncing Ideas}, AI is useful for quickly sketching
+      out a mockup to test a hypothesis, which significantly sped up
+      working through theories about how the format is structured.
+
+\end{itemize}
+
+AI was \textbf{not} used to determine byte
+offsets, understand structural metadata, or how the code in general should be written and organized. All format understanding came
+from:
+
+\begin{itemize}
+    \item Manual hex inspection (HxD)
+    \item The Linux kernel boot protocol documentation
+          (\url{https://www.kernel.org/doc/html/v6.1/x86/boot.html})
+    \item The SquashFS specification
+          (\url{https://dr-emann.github.io/squashfs/})
+    \item Binwalk (To see if anything major is missing)
+\end{itemize}
+
+% ==============================================================
+\section{Image Layout}
+
+Every byte in the image falls into one of the following regions. Exact
+offsets are read from the headers themselves, no hardcoded assumptions
+about layout are made.
+
+\begin{lstlisting}[style=hexstyle, basicstyle=\ttfamily\footnotesize]
+[0x00000000 			-> Live.UpgradeHeader]		Live Start Header + Metadata
+[Live.UpgradeHeader 	-> Upgrade.MetaData.End] 	Upgrade Header + Metadata
+[Upgrade.MetaData.End 	-> +0x200]            		Master Boot Record (512 bytes)
+[MBR end 				-> kernelPayloadStart] 		Kernel Setup Sectors
+[kernelPayloadStart 	-> kernelPayloadEnd]    	Kernel Payload (XZ vmlinux)
+[kernelPayloadEnd 		-> initramfsStart]        	Unknown / Padding
+[initramfsStart 		-> Live.FileSystemHeader]   Initramfs
+[Live.FileSystemHeader 	-> Live.FileEnd]     		SquashFS Filesystem
+\end{lstlisting}
+
+% ==============================================================
+\section{Region-by-Region Breakdown}
+
+% --------------------------------------------------------------
+\subsection{Live Start Header (\texttt{0x00000000})}
+
+The image begins with a \textbf{Live Start Header}. This is a proprietary
+header that acts as the outermost envelope for the entire firmware image.
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Offset} & \textbf{Size} & \textbf{Field} & \textbf{Notes} \\
+\midrule
+\texttt{0x00} & 4  & Magic            & \\
+\texttt{0x04} & 48 & Signature        & hash \\
+\texttt{0x34} & 4  & Padding          & Always \texttt{0x00000000} \\
+\texttt{0x38} & 8  & Anchor           & \texttt{DE AD BE EF DE AD BE EF} \\
+\texttt{0x40} & 4  & UpgradeHeader    & Absolute offset to Upgrade Header \\
+\texttt{0x44} & 4  & Unknown          & Purpose unknown \\
+\texttt{0x48} & 4  & Flags            & \\
+\texttt{0x4C} & 4  & FileSystemHeader & Absolute offset to SquashFS \\
+\texttt{0x50} & 4  & FileEnd          & Absolute end of image \\
+\texttt{0x54} & 56 & NullPad          & Zero padding \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+After the fixed fields, a \textbf{metadata block} begins at
+\texttt{0x8C} and extends to \texttt{UpgradeHeader}. This block uses a
+TLV (Type-Length-Value) encoding with big-endian fields. It contains a
+standard TLV section followed by a compact TLV section (1-byte tags,
+2-byte lengths). The compact block ends with a 5-byte sentinel
+(\texttt{0C 00 01 41 EB}) immediately before the next structural region.
+
+The fields \texttt{UpgradeHeader}, \texttt{FileSystemHeader}, and
+\texttt{FileEnd} fully determine where every subsequent region begins. Because this header starts at 0x0, these positions are also absolute offsets unlike every other offset in the file.
+
+% --------------------------------------------------------------
+\subsection{Upgrade Header}
+
+Located at the absolute offset stored in \texttt{Live.UpgradeHeader}.
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Offset} & \textbf{Size} & \textbf{Field} & \textbf{Notes} \\
+\midrule
+\texttt{0x00} & 4  & Magic            & \\
+\texttt{0x04} & 48 & Signature        & \\
+\texttt{0x34} & 4  & Padding          & \\
+\texttt{0x38} & 8  & Anchor           & \texttt{DE AD BE EF DE AD BE EF} \\
+\texttt{0x40} & 4  & MasterBootRecord & Relative offset to MBR \\
+\texttt{0x44} & 4  & Unknown          & Purpose unknown \\
+\texttt{0x48} & 4  & Flags            & \\
+\texttt{0x4C} & 4  & Initramfs        & Relative offset to initramfs \\
+\texttt{0x50} & 4  & FileSystemHeader & SquashFS offset (mirrors Live, relative to this header) \\
+\texttt{0x54} & 56 & NullPad          & Zero padding \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Like the Live header, this is followed by its own metadata block
+(TLV + compact TLV). The metadata block ends at
+\texttt{Upgrade.MetaData.End}. These two headers are called Live and Upgrade because i suspect that the first one is the Live one actively being used and the second one is the one that is used when upgrading, though this is not confirmed.
+
+% --------------------------------------------------------------
+\subsection{Master Boot Record}
+
+Begins immediately at \texttt{Upgrade.MetaData.End}. Standard 512-byte (0x200)
+MBR layout:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Range} & \textbf{Size} & \textbf{Content} \\
+\midrule
+\texttt{0x000}--\texttt{0x1BD} & 446 & Bootstrap / boot code (x86) \\
+\texttt{0x1BE}--\texttt{0x1FD} & 64  & Partition table (4 \(\times\) 16-byte entries) \\
+\texttt{0x1FE}--\texttt{0x1FF} & 2   & Boot signature (\texttt{55 AA}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each of the four partition entries contains:
+
+\begin{itemize}
+    \item \textbf{Status} (1 byte): \texttt{0x80} = bootable
+    \item \textbf{CHS First / Last} (3 bytes each): legacy, mostly unused
+    \item \textbf{LBA Start} and \textbf{Sector Count} (4 bytes each):
+          the fields that actually describe the partition
+    \item \textbf{Type} (1 byte): partition type identifier
+\end{itemize}
+
+% --------------------------------------------------------------
+\subsection{Kernel Setup Sectors}
+
+The kernel image begins immediately after the MBR
+(\texttt{mbrStart + 0x200}). The Linux boot protocol defines a
+\textbf{real-mode kernel header} at byte offset \texttt{0x1F1} within the
+kernel image. Relevant fields:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Offset} & \textbf{Field} & \textbf{Notes} \\
+\midrule
+\texttt{0x1F1} & \texttt{setup\_sects} & Number of setup sectors \\
+\texttt{0x200} & Jump              & \texttt{EB xx} short jump \\
+\texttt{0x202} & Magic             & \texttt{HdrS} (\texttt{0x53726448}) \\
+\texttt{0x206} & Version           & Boot protocol version \\
+\texttt{0x248} & PayloadOffset     & Offset from setup end to compressed kernel \\
+\texttt{0x24C} & PayloadLength     & Size of compressed kernel payload \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The setup region ends at \((\texttt{setup\_sects} + 1) \times 512\) bytes
+from the kernel base. \texttt{PayloadOffset} is relative to that
+boundary.
+
+% --------------------------------------------------------------
+\subsection{Kernel Payload}
+
+\[
+  \texttt{kernelPayloadStart} = \texttt{kernelStart} + \texttt{PayloadOffset}
+\]
+\[
+  \texttt{kernelPayloadEnd} = \texttt{kernelPayloadStart} + \texttt{PayloadLength}
+\]
+
+This region contains the XZ-compressed \texttt{vmlinux}. It can be
+decompressed independently if needed.
+
+% --------------------------------------------------------------
+\subsection{Unknown / Padding Region}
+
+\[
+  [\,\texttt{kernelPayloadEnd},\;
+     \texttt{Live.UpgradeHeader} + \texttt{Upgrade.Initramfs}\,)
+\]
+
+This region lies between the end of the kernel payload and the start of
+the initramfs. Its purpose was not fully determined, alignment padding
+or an additional bootloader artifact is suspected.
+
+% --------------------------------------------------------------
+\subsection{Initramfs}
+
+\[
+  \texttt{initramfsStart} = \texttt{Live.UpgradeHeader} + \texttt{Upgrade.Initramfs}
+\]
+\[
+  \texttt{initramfsEnd} = \texttt{Live.FileSystemHeader}
+\]
+
+The initramfs is a compressed CPIO archive. It is extracted as-is
+(\texttt{initramfs.cpio}) in the output directory. The raw byte range is
+fully determined by the header fields above.
+
+% --------------------------------------------------------------
+\subsection{SquashFS Filesystem}
+
+Begins at the absolute offset stored in \texttt{Live.FileSystemHeader}.
+This is the main read-only root filesystem. Parsing is described in full
+in Section~\ref{sec:squashfs}.
+
+% ==============================================================
+\section{SquashFS Parsing}
+\label{sec:squashfs}
+
+The SquashFS specification at
+\url{https://dr-emann.github.io/squashfs/} was followed directly.
+The filesystem uses \textbf{XZ compression} (\texttt{CompressionID = 4}).
+
+% --------------------------------------------------------------
+\subsection{SquashFS Superblock (96 bytes, little-endian)}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Offset} & \textbf{Type} & \textbf{Field} & \textbf{Notes} \\
+\midrule
+\texttt{0x00} & \texttt{uint32} & Magic               & \texttt{0x73717368} \\
+\texttt{0x04} & \texttt{uint32} & InodeCount          & \\
+\texttt{0x08} & \texttt{uint32} & ModificationTime    & Unix timestamp \\
+\texttt{0x0C} & \texttt{uint32} & BlockSize           & \\
+\texttt{0x10} & \texttt{uint32} & FragmentEntryCount  & \\
+\texttt{0x14} & \texttt{uint16} & CompressionID       & 4 = XZ \\
+\texttt{0x16} & \texttt{uint16} & BlockLog            & \\
+\texttt{0x18} & \texttt{uint16} & Flags               & \\
+\texttt{0x1A} & \texttt{uint16} & IDCount             & \\
+\texttt{0x1C} & \texttt{uint16} & VersionMajor        & \\
+\texttt{0x1E} & \texttt{uint16} & VersionMinor        & \\
+\texttt{0x20} & \texttt{uint64} & RootInodeRef        & Block + intra offset \\
+\texttt{0x28} & \texttt{uint64} & BytesUsed           & \\
+\texttt{0x30} & \texttt{uint64} & IDTableStart        & Absolute \\
+\texttt{0x38} & \texttt{uint64} & XattrIDTableStart   & Absolute \\
+\texttt{0x40} & \texttt{uint64} & InodeTableStart     & Relative to SquashFS base \\
+\texttt{0x48} & \texttt{uint64} & DirectoryTableStart & Relative to SquashFS base \\
+\texttt{0x50} & \texttt{uint64} & FragmentTableStart  & Absolute \\
+\texttt{0x58} & \texttt{uint64} & ExportTableStart    & Absolute \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+All table start offsets are used directly to locate each table.
+
+% --------------------------------------------------------------
+\subsection{Metadata Blocks}
+
+All SquashFS metadata (inodes, directories, export table, ID table, xattr
+table) is stored in \textbf{metadata blocks}. Each block is preceded by a
+2-byte little-endian header:
+
+\begin{itemize}
+    \item \textbf{Bit 15}: \texttt{0} = XZ-compressed,
+          \texttt{1} = uncompressed
+    \item \textbf{Bits 14--0}: size of the following data in bytes
+\end{itemize}
+
+The \texttt{readSquashFSMetadataBlocks} function reads a contiguous range
+of these blocks and returns the fully decompressed byte stream.
+
+% --------------------------------------------------------------
+\subsection{Inode Table}
+
+Located between \texttt{InodeTableStart} and \texttt{DirectoryTableStart}
+(both relative to the SquashFS base). Each inode begins with a common
+16-byte header:
+
+\begin{lstlisting}[style=gostyle]
+type InodeHeader struct {
+    InodeType    uint16
+    Permissions  uint16
+    UIDIdx       uint16
+    GIDIdx       uint16
+    ModifiedTime uint32
+    InodeNumber  uint32
+}
+\end{lstlisting}
+
+Followed by a type-specific body. Inode types parsed:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Type} & \textbf{Name} & \textbf{Notes} \\
+\midrule
+1  & Basic Directory    & Fixed 16-byte body \\
+2  & Basic File         & Variable: \texttt{BlockSizes} array \\
+3  & Basic Symlink      & Variable: target string \\
+8  & Extended Directory & Variable: includes \texttt{DirIndex} array \\
+9  & Extended File      & Variable: larger fields + \texttt{BlockSizes} \\
+10 & Extended Symlink   & Includes \texttt{XattrIdx} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For file inodes, the \texttt{BlockSizes} array length is computed as:
+
+\[
+  \texttt{blockCount} =
+  \begin{cases}
+    \left\lceil \dfrac{\texttt{FileSize}}{\texttt{BlockSize}} \right\rceil
+      & \text{if } \texttt{FragmentBlockIndex} = \texttt{0xFFFFFFFF} \\[8pt]
+    \left\lfloor \dfrac{\texttt{FileSize}}{\texttt{BlockSize}} \right\rfloor
+      & \text{otherwise (tail stored in fragment)}
+  \end{cases}
+\]
+
+% --------------------------------------------------------------
+\subsection{Directory Table}
+
+Located between \texttt{DirectoryTableStart} and
+\texttt{FragmentTableStart}. Each directory consists of a 12-byte
+\texttt{DirectoryHeader} followed by \(\texttt{Count} + 1\) entries.
+
+\begin{lstlisting}[style=gostyle]
+type DirectoryHeader struct {
+    Count       uint32  // number of entries minus 1
+    Start       uint32  // block offset into inode table
+    InodeNumber uint32  // inode number of this directory
+}
+
+type DirectoryEntry struct {
+    Offset      uint16
+    InodeOffset int16   // signed delta from header InodeNumber
+    Type        uint16
+    NameSize    uint16
+    Name        []uint8 // NameSize + 1 bytes
+}
+\end{lstlisting}
+
+The absolute inode number for each entry is:
+\[
+  \texttt{inodeNumber} =
+  \texttt{header.InodeNumber} + \texttt{entry.InodeOffset}
+\]
+
+% --------------------------------------------------------------
+\subsection{Fragment Table}
+
+For files whose final data does not fill a complete block, the remainder
+is stored in a \textbf{fragment block}. The fragment table is an indirect
+structure:
+
+\begin{enumerate}
+    \item \texttt{FragmentTableStart} points to a list of 8-byte absolute
+          pointers (one per metadata block of fragment entries).
+    \item Each pointer references a metadata block containing
+          \texttt{FragmentBlockEntry} structs:
+\end{enumerate}
+
+\begin{lstlisting}[style=gostyle]
+type FragmentBlockEntry struct {
+    Start  uint64  // absolute offset of compressed fragment block
+    Size   uint32  // bit 24: uncompressed flag; bits 23-0: size
+    Unused uint32
+}
+\end{lstlisting}
+
+To read a file's fragment tail: decompress the fragment block at
+\texttt{Fragments[FragmentBlockIndex].Start}, then read
+\texttt{remaining} bytes starting at \texttt{BlockOffset}.
+
+% --------------------------------------------------------------
+\subsection{Export Table}
+
+Maps inode numbers to inode references (block offset + intra-block
+offset). Used to locate the root inode by matching
+\texttt{RootInodeRef}:
+
+\begin{itemize}
+    \item \textbf{Bits 63--16}: block offset from \texttt{InodeTableStart}
+    \item \textbf{Bits 15--0}: byte offset within the decompressed block
+\end{itemize}
+
+% --------------------------------------------------------------
+\subsection{ID Table}
+
+Maps UID/GID index values (stored in inodes) to actual UID/GID integer
+values. Uses the same indirect pointer-then-metadata-block structure as
+the fragment table.
+
+% --------------------------------------------------------------
+\subsection{Xattr Table}
+
+A three-level structure:
+
+\begin{enumerate}
+    \item \textbf{XattrIDTable} at \texttt{XattrIDTableStart}: contains
+          \texttt{XattrTableStart} (absolute pointer to key/value data),
+          \texttt{XattrIds} count, and a list of pointers to lookup
+          metadata blocks.
+
+    \item \textbf{Lookup table}: array of 16-byte
+          \texttt{XattrLookupTable} structs, one per xattr set.
+          Each entry contains an \texttt{XattrRef} (offset into the
+          key/value data), a \texttt{Count} of key/value pairs, and a
+          \texttt{Size}.
+
+    \item \textbf{Key/value data} at \texttt{XattrTableStart}: compact
+          TLV pairs. Each key entry is a 2-byte type, 2-byte name size,
+          and name bytes. Each value entry is a 4-byte value size followed
+          by value bytes. If bit 8 of the key type is set, the value is
+          stored out-of-line.
+\end{enumerate}
+
+Each inode's \texttt{XattrIdx} field indexes into the lookup table to
+find its associated xattr set.
+
+% ==============================================================
+\section{File Extraction}
+
+Extraction walks every parsed inode. For each file inode:
+
+\begin{enumerate}
+    \item \textbf{Build the full path} by walking \texttt{ParentMap} from
+          the inode up to the root inode, collecting names from
+          \texttt{NameMap} at each step.
+
+    \item \textbf{Write full data blocks} in order. For each entry in
+          \texttt{BlockSizes}:
+          \begin{itemize}
+              \item Bit 24 set \(\Rightarrow\) uncompressed, read directly
+              \item Bit 24 clear \(\Rightarrow\) XZ decompress
+              \item Size = 0 \(\Rightarrow\) sparse block (zero-fill one
+                    \texttt{BlockSize} of bytes)
+          \end{itemize}
+
+    \item \textbf{Write the fragment tail} if
+          \texttt{FragmentBlockIndex} \(\neq\) \texttt{0xFFFFFFFF}:
+          decompress the fragment block and append bytes
+          \([\texttt{BlockOffset},\; \texttt{BlockOffset} +
+          \texttt{remaining})\).
+\end{enumerate}
+
+Symlinks are created with \texttt{os.Symlink}. Directories are created
+with \texttt{os.MkdirAll}. The \texttt{ParentMap} is built during
+directory parsing by matching each directory inode's
+\texttt{DirBlockStart} and \texttt{BlockOffset} against directory table
+entries.
+
+% ==============================================================
+\section{What Remains Unexplained}
+
+\begin{itemize}
+    \item \textbf{The 5-byte compact TLV sentinel}
+          (\texttt{0C 00 01 41 EB}): consistent across images, appears
+          immediately before the next firmware region. Treated as a block
+          terminator; semantic meaning is unknown.
+
+    \item \textbf{\texttt{Unknown} in both headers}: a 4-byte big-endian
+          value present in both Live and Upgrade headers. Possibly a size
+          field.
+
+    \item \textbf{Region between kernel payload and initramfs}:
+          It is the Linux Kernel Early Boot Stub and Decompressor (specifically for x86-64).
+
+    \item \textbf{Metadata block \texttt{BlockType} field}: parsed but not
+          interpreted, likely a version or type discriminator for the
+          proprietary header format.
+\end{itemize}
+
+\end{document}

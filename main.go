@@ -23,8 +23,8 @@ type FirmwareFile struct {
 	Upgrade    *UpgradeHeader
 	MBR        *MBR
 	Kernel     *Kernel
+	BootStub   []byte
 	Initramfs  *Initramfs
-	EHFrame    *EHFrame
 	FileSystem *SquashFS
 }
 
@@ -142,12 +142,6 @@ type CpioEntry struct {
 	Mode uint32
 	Size uint64
 	Data []byte
-}
-
-type EHFrame struct {
-	Data  []byte
-	Start uint64
-	End   uint64
 }
 
 type MappedFile struct {
@@ -813,16 +807,12 @@ func main() {
 	initramfsStart := uint64(file.Live.UpgradeHeader + file.Upgrade.Initramfs)
 	initramfsEnd := uint64(file.Live.FileSystemHeader)
 
+	file.BootStub = data[kernelPayloadEnd : file.Live.UpgradeHeader+file.Upgrade.Initramfs]
+
 	file.Initramfs = &Initramfs{
 		Data:  data[initramfsStart:initramfsEnd],
 		Start: initramfsStart,
 		End:   initramfsEnd,
-	}
-
-	file.EHFrame = &EHFrame{
-		Data:  data[initramfsEnd:file.Live.FileSystemHeader],
-		Start: initramfsEnd,
-		End:   uint64(file.Live.FileSystemHeader),
 	}
 
 	initramfsOut := filepath.Join(filepath.Dir(filePath), "output")
@@ -840,26 +830,13 @@ func main() {
 		{"MBR", uint64(file.Upgrade.MetaData.End), mbrStart + 0x200},
 		{"Kernel Setup", kernelStart, kernelPayloadStart},
 		{"Kernel Payload", kernelPayloadStart, kernelPayloadEnd},
-		{"Unknown", kernelPayloadEnd, uint64(file.Live.UpgradeHeader + file.Upgrade.Initramfs)},
+		{"Kernel Early Boot Stub", kernelPayloadEnd, uint64(file.Live.UpgradeHeader + file.Upgrade.Initramfs)},
 		{"Initramfs", uint64(file.Live.UpgradeHeader + file.Upgrade.Initramfs), uint64(file.Live.FileSystemHeader)},
 		{"SquashFS", uint64(file.Live.FileSystemHeader), uint64(file.Live.FileEnd)},
 	}
 
 	for _, r := range regions {
-		fmt.Printf("  %-20s [0x%08X - 0x%08X] (%d MB)\n",
+		fmt.Printf("  %-25s [0x%08X - 0x%08X] (%d MB)\n",
 			r.name, r.start, r.end, (r.end-r.start)/1024/1024)
 	}
-
-	// PayloadOffset is relative to the end of the setup sectors
-	// Actual payload start = setup_end + PayloadOffset
-	// Where setup_end = (setup_sects + 1) * 512
-
-	//setupSects := data[0x1F1] // byte just before the header
-	//setupEnd := (uint32(setupSects) + 1) * 512
-	//
-	//payloadStart := setupEnd + file.Kernel.Header.PayloadOffset
-	//payloadEnd := payloadStart + file.Kernel.Header.PayloadLength
-	//
-	//fmt.Printf("0x%08X\n", payloadStart)
-	//fmt.Printf("0x%08X\n", payloadEnd)
 }
