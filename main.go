@@ -4,18 +4,12 @@ package main
 
 import (
 	"bytes"
-	//"compress/gzip"
+	"path/filepath"
+
 	"encoding/binary"
 	"fmt"
-	//"io"
 	"os"
-	"path/filepath"
 	"runtime/debug"
-	"time"
-	"unsafe"
-
-	//"github.com/ulikunitz/xz"
-	"golang.org/x/sys/windows"
 )
 
 type FirmwareFile struct {
@@ -56,12 +50,6 @@ type UpgradeHeader struct {
 	MetaData         *MetaDataBlock
 }
 
-type TLV struct {
-	Tag    uint32
-	Length uint32
-	Value  []byte
-}
-
 type MetaDataBlock struct {
 	BlockType uint32
 	TLVs      []TLV
@@ -73,6 +61,12 @@ type MetaDataBlock struct {
 	DataA     []byte
 
 	SubBlocks []*MetaDataBlock
+}
+
+type TLV struct {
+	Tag    uint32
+	Length uint32
+	Value  []byte
 }
 
 type MBR struct {
@@ -88,6 +82,11 @@ type PartitionEntry struct {
 	CHSLast     [3]byte
 	LBAStart    uint32
 	SectorCount uint32
+}
+
+type Kernel struct {
+	Header *KernelHeader
+	Data   []byte
 }
 
 // https://www.kernel.org/doc/html/v6.1/x86/boot.html#the-real-mode-kernel-header
@@ -125,91 +124,10 @@ type KernelHeader struct {
 	HandoverOffset      uint32 // 0x264
 }
 
-type Kernel struct {
-	//Preamble [0x1F1]byte // everything before the header
-	Header *KernelHeader
-	Data   []byte
-}
-
 type Initramfs struct {
 	Data  []byte
 	Start uint64
 	End   uint64
-}
-
-type CpioEntry struct {
-	Name string
-	Mode uint32
-	Size uint64
-	Data []byte
-}
-
-type MappedFile struct {
-	data   []byte
-	handle windows.Handle
-	mapObj windows.Handle
-}
-
-func openMapped(path string) (*MappedFile, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	size, err := f.Seek(0, 2)
-	if err != nil {
-		return nil, err
-	}
-	if size == 0 {
-		return nil, fmt.Errorf("file is empty: %s", path)
-	}
-
-	handle := windows.Handle(f.Fd())
-
-	mapObj, err := windows.CreateFileMapping(
-		handle,
-		nil,
-		windows.PAGE_READONLY,
-		0, 0,
-		nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("CreateFileMapping: %w", err)
-	}
-
-	addr, err := windows.MapViewOfFile(
-		mapObj,
-		windows.FILE_MAP_READ,
-		0, 0,
-		0,
-	)
-	if err != nil {
-		windows.CloseHandle(mapObj)
-		return nil, fmt.Errorf("MapViewOfFile: %w", err)
-	}
-
-	data := unsafe.Slice((*byte)(unsafe.Pointer(addr)), size)
-
-	return &MappedFile{
-		data:   data,
-		handle: windows.Handle(addr),
-		mapObj: mapObj,
-	}, nil
-}
-
-func (m *MappedFile) Close() error {
-	err1 := windows.UnmapViewOfFile(uintptr(m.handle))
-	err2 := windows.CloseHandle(m.mapObj)
-	m.data = nil
-	if err1 != nil {
-		return err1
-	}
-	return err2
-}
-
-func (m *MappedFile) Data() []byte {
-	return m.data
 }
 
 func fill[structure any](data []byte, offset uint64, order binary.ByteOrder) *structure {
@@ -282,7 +200,7 @@ func parseMetaData(start uint32, end uint32, data []byte) *MetaDataBlock {
 
 		if bytes.Equal(data[compactBlock.End:compactBlock.End+0x5], compactBlockEnd) {
 			// this is a correction. I don't know what these 5 bytes do, but they are
-			// consistent and always before the firmware so...
+			// consistent and always before the firmware so im assuming they are a sentinel.
 			compactBlock.End += 0x5
 			break
 		}
@@ -335,117 +253,6 @@ func parseUpgradeHeader(file *FirmwareFile, data []byte, offset uint64) *Upgrade
 	return hdr
 }
 
-//func detectCompression(data []byte) string {
-//	switch {
-//	case len(data) >= 2 && data[0] == 0x1F && data[1] == 0x8B:
-//		return "gzip"
-//	case len(data) >= 6 && data[0] == 0xFD && string(data[1:6]) == "7zXZ\x00":
-//		return "xz"
-//	case len(data) >= 4 && data[0] == 0x02 && data[1] == 0x21 && data[2] == 0x4C && data[3] == 0x18:
-//		return "lz4"
-//	case len(data) >= 3 && data[0] == 0x5D && data[1] == 0x00 && data[2] == 0x00:
-//		return "lzma"
-//	case len(data) >= 4 && string(data[0:4]) == "\x28\xB5\x2F\xFD":
-//		return "zstd"
-//	default:
-//		return "unknown"
-//	}
-//}
-//
-//func parseInitramfs(data []byte, start, end uint64) (*Initramfs, error) {
-//	raw := data[start:end]
-//	compression := detectCompression(raw)
-//	fmt.Printf("  Initramfs compression: %s\n", compression)
-//
-//	var reader io.Reader
-//	switch compression {
-//	case "gzip":
-//		r, err := gzip.NewReader(bytes.NewReader(raw))
-//		if err != nil {
-//			return nil, fmt.Errorf("gzip reader: %w", err)
-//		}
-//		defer r.Close()
-//		reader = r
-//	case "xz":
-//		r, err := xz.NewReader(bytes.NewReader(raw))
-//		if err != nil {
-//			return nil, fmt.Errorf("xz reader: %w", err)
-//		}
-//		reader = r
-//	default:
-//		return nil, fmt.Errorf("unsupported compression: %s", compression)
-//	}
-//
-//	decompressed, err := io.ReadAll(reader)
-//	if err != nil {
-//		return nil, fmt.Errorf("decompression failed: %w", err)
-//	}
-//
-//	return &Initramfs{
-//		Data:  decompressed,
-//		Start: start,
-//		End:   end,
-//	}, nil
-//}
-//
-//func parseCpio(data []byte) ([]CpioEntry, error) {
-//	var entries []CpioEntry
-//	offset := 0
-//
-//	for offset+110 <= len(data) {
-//		magic := string(data[offset : offset+6])
-//		if magic == "TRAILER" {
-//			break
-//		}
-//		if magic != "070701" && magic != "070702" {
-//			return nil, fmt.Errorf("invalid cpio magic at 0x%X: %q", offset, magic)
-//		}
-//
-//		// CPIO newc header is 110 bytes, all fields are 8-char hex ASCII
-//		parseHex := func(s []byte) uint32 {
-//			var v uint32
-//			fmt.Sscanf(string(s), "%x", &v)
-//			return v
-//		}
-//
-//		h := data[offset:]
-//		mode := parseHex(h[14:22])
-//		fileSize := uint64(parseHex(h[54:62]))
-//		nameSize := uint32(parseHex(h[94:102]))
-//		offset += 110
-//
-//		// Name
-//		name := string(data[offset : offset+int(nameSize)-1]) // strip null terminator
-//		offset += int(nameSize)
-//		// Align to 4 bytes
-//		if offset%4 != 0 {
-//			offset += 4 - offset%4
-//		}
-//
-//		if name == "TRAILER!!!" {
-//			break
-//		}
-//
-//		// Data
-//		fileData := make([]byte, fileSize)
-//		copy(fileData, data[offset:offset+int(fileSize)])
-//		offset += int(fileSize)
-//		// Align to 4 bytes
-//		if offset%4 != 0 {
-//			offset += 4 - offset%4
-//		}
-//
-//		entries = append(entries, CpioEntry{
-//			Name: name,
-//			Mode: mode,
-//			Size: fileSize,
-//			Data: fileData,
-//		})
-//	}
-//
-//	return entries, nil
-//}
-
 func extractInitramfs(data []byte, start, end uint64, outputPath string) error {
 	raw := data[start:end]
 
@@ -458,174 +265,63 @@ func extractInitramfs(data []byte, start, end uint64, outputPath string) error {
 	return nil
 }
 
-func printFirmwareFile(file *FirmwareFile) {
-	// AI generated
-
-	fmt.Println("\n=== Firmware File ===")
-
-	fmt.Println("\n--- Live Start Header ---")
-	fmt.Printf("  Magic:             0x%08X\n", file.Live.Magic)
-	fmt.Printf("  Firmware Header:   0x%08X\n", file.Live.UpgradeHeader)
-	fmt.Printf("  UnknownB:          0x%08X\n", file.Live.UnknownB)
-	fmt.Printf("  Flags:             0x%08X\n", file.Live.Flags)
-	fmt.Printf("  File System:       0x%08X\n", file.Live.FileSystemHeader)
-	fmt.Printf("  File End:          0x%08X\n", file.Live.FileEnd)
-
-	fmt.Println("\n--- Upgrade Header ---")
-	fmt.Printf("  Magic:             0x%08X\n", file.Upgrade.Magic)
-	fmt.Printf("  MBR:               0x%08X\n", file.Upgrade.MasterBootRecord)
-	fmt.Printf("  UnknownB:          0x%08X\n", file.Upgrade.UnknownB)
-	fmt.Printf("  UnknownC:          0x%08X\n", file.Upgrade.Flags)
-	fmt.Printf("  Initramfs:       0x%08X\n", file.Upgrade.Initramfs)
-	fmt.Printf("  File System:       0x%08X\n", file.Upgrade.FileSystemHeader)
-
-	fmt.Println("\n--- MBR ---")
-	fmt.Printf("  Boot Signature:    0x%X\n", file.MBR.BootSignature)
-	for i, entry := range file.MBR.PartitionTable {
-		fmt.Printf("  Partition %d:\n", i)
-		fmt.Printf("    Status:          0x%02X (%s)\n", entry.Status, func() string {
-			if entry.Status == 0x80 {
-				return "bootable"
-			}
-			return "not bootable"
-		}())
-		fmt.Printf("    Type:            0x%02X\n", entry.Type)
-		fmt.Printf("    LBA Start:       0x%08X (%d)\n", entry.LBAStart, entry.LBAStart)
-		fmt.Printf("    Sector Count:    0x%08X (%d)\n", entry.SectorCount, entry.SectorCount)
-		fmt.Printf("    CHS First:       %02X %02X %02X\n", entry.CHSFirst[0], entry.CHSFirst[1], entry.CHSFirst[2])
-		fmt.Printf("    CHS Last:        %02X %02X %02X\n", entry.CHSLast[0], entry.CHSLast[1], entry.CHSLast[2])
-	}
-
-	fmt.Println("\n--- Kernel ---")
-	fmt.Printf("  Jump:                %02X %02X\n", file.Kernel.Header.Jump&0xFF, file.Kernel.Header.Jump>>8)
-	fmt.Printf("  Magic:               0x%08X\n", file.Kernel.Header.Magic)
-	fmt.Printf("  Boot Protocol:       %d.%d\n", file.Kernel.Header.Version>>8, file.Kernel.Header.Version&0xFF)
-	fmt.Printf("  Type Of Loader:      0x%02X\n", file.Kernel.Header.TypeOfLoader)
-	fmt.Printf("  Load Flags:          0x%02X\n", file.Kernel.Header.LoadFlags)
-	fmt.Printf("  Setup Move Size:     0x%04X\n", file.Kernel.Header.SetupMoveSize)
-	fmt.Printf("  Code32 Start:        0x%08X\n", file.Kernel.Header.Code32Start)
-	fmt.Printf("  Ramdisk Image:       0x%08X\n", file.Kernel.Header.RamdiskImage)
-	fmt.Printf("  Ramdisk Size:        0x%08X\n", file.Kernel.Header.RamdiskSize)
-	fmt.Printf("  Heap End Ptr:        0x%04X\n", file.Kernel.Header.HeapEndPtr)
-	fmt.Printf("  Cmdline Ptr:         0x%08X\n", file.Kernel.Header.CmdLinePtr)
-	fmt.Printf("  Initrd Addr Max:     0x%08X\n", file.Kernel.Header.InitrdAddrMax)
-	fmt.Printf("  Kernel Alignment:    0x%08X\n", file.Kernel.Header.KernelAlignment)
-	fmt.Printf("  Relocatable:         %v\n", file.Kernel.Header.RelocatableKernel != 0)
-	fmt.Printf("  Min Alignment:       0x%02X\n", file.Kernel.Header.MinAlignment)
-	fmt.Printf("  XLoad Flags:         0x%04X\n", file.Kernel.Header.XLoadFlags)
-	fmt.Printf("  Cmdline Size:        %d\n", file.Kernel.Header.CmdlineSize)
-	fmt.Printf("  Hardware Subarch:    0x%08X\n", file.Kernel.Header.HardwareSubarch)
-	fmt.Printf("  HW Subarch Data:     0x%016X\n", file.Kernel.Header.HardwareSubarchData)
-	fmt.Printf("  Payload Offset:      0x%08X\n", file.Kernel.Header.PayloadOffset)
-	fmt.Printf("  Payload Length:      0x%08X (%d KB)\n", file.Kernel.Header.PayloadLength, file.Kernel.Header.PayloadLength/1024)
-	fmt.Printf("  Setup Data:          0x%016X\n", file.Kernel.Header.SetupData)
-	fmt.Printf("  Pref Address:        0x%016X\n", file.Kernel.Header.PrefAddress)
-	fmt.Printf("  Init Size:           0x%08X (%d MB)\n", file.Kernel.Header.InitSize, file.Kernel.Header.InitSize/1024/1024)
-	fmt.Printf("  Handover Offset:     0x%08X\n", file.Kernel.Header.HandoverOffset)
-	fmt.Printf("  Kernel Version Ptr:  0x%04X\n", file.Kernel.Header.KernelVersion)
-	fmt.Printf("  Data Size:           0x%X (%d KB)\n", len(file.Kernel.Data), len(file.Kernel.Data)/1024)
-
-	fmt.Println("\n--- Squashfs Header ---")
-	fmt.Printf("  Magic:             0x%08X\n", file.FileSystem.Header.Magic)
-	fmt.Printf("  Inodes:            %d\n", file.FileSystem.Header.InodeCount)
-	fmt.Printf("  Modified:          %s\n", time.Unix(int64(file.FileSystem.Header.ModificationTime), 0))
-	fmt.Printf("  Block Size:        %d bytes\n", file.FileSystem.Header.BlockSize)
-	fmt.Printf("  Fragments:         %d\n", file.FileSystem.Header.FragmentEntryCount)
-	fmt.Printf("  Compression:       %d (4=XZ)\n", file.FileSystem.Header.CompressionID)
-	fmt.Printf("  Flags:             0x%04X\n", file.FileSystem.Header.Flags)
-	fmt.Printf("  Version:           %d.%d\n", file.FileSystem.Header.VersionMajor, file.FileSystem.Header.VersionMinor)
-	fmt.Printf("  Root Inode:        0x%X\n", file.FileSystem.Header.RootInodeRef)
-	fmt.Printf("  Bytes Used:        0x%X (%d MB)\n", file.FileSystem.Header.BytesUsed, file.FileSystem.Header.BytesUsed/1024/1024)
-	fmt.Printf("  Inode Table:       0x%X\n", uint32(file.FileSystem.Header.InodeTableStart))
-	fmt.Printf("  Dir Table:         0x%X\n", uint32(file.FileSystem.Header.DirectoryTableStart))
-	fmt.Printf("  Fragment Table:    0x%X\n", uint32(file.FileSystem.Header.FragmentTableStart))
-	fmt.Printf("  Export Table:      0x%X\n", uint32(file.FileSystem.Header.ExportTableStart))
-	fmt.Printf("  ID Table:          0x%X\n", uint32(file.FileSystem.Header.IDTableStart))
-
-	fmt.Println("\n--- Inodes ---")
-	for _, pair := range file.FileSystem.Inodes {
-		fmt.Printf("  [%2d] Type: %d  Perms: 0%04o  Modified: %s\n",
-			pair.Header.InodeNumber,
-			pair.Header.InodeType,
-			pair.Header.Permissions,
-			time.Unix(int64(pair.Header.ModifiedTime), 0),
-		)
-		switch body := pair.Body.(type) {
-		case *ExtendedFile:
-			fmt.Printf("       File    Size: %d bytes  Blocks: %d  Fragment: 0x%X\n",
-				body.FileSize, len(body.BlockSizes), body.FragmentBlockIndex)
-			fmt.Printf("Inode %d: BlocksStart=0x%X\n", pair.Header.InodeNumber, pair.Body.(*ExtendedFile).BlocksStart)
-
-		case *ExtendedDirectory:
-			fmt.Printf("       Dir     Size: %d  Children: %d  Parent: %d\n",
-				body.FileSize, body.HardLinkCount-2, body.ParentInodeNumber)
-		}
-	}
-
-	fmt.Println("\n--- Directories ---")
-	for _, dir := range file.FileSystem.Directories {
-		fmt.Printf("  Block 0x%X  InodeRef: %d  Entries: %d\n",
-			dir.Header.Start, dir.Header.InodeNumber, dir.Header.Count+1)
-		for _, entry := range dir.Entry {
-			fmt.Printf("    [type %d] %s  offset=0x%X  inodeOff=%d\n",
-				entry.Type, entry.Name, entry.Offset, entry.InodeOffset)
-		}
-	}
-
-	fmt.Println("\n--- Fragments ---")
-	for i, frag := range file.FileSystem.Fragments {
-		compressed := (frag.Size & 0x1000000) == 0
-		size := frag.Size & 0xFFFFFF
-		fmt.Printf("  [%d] Start: 0x%X  Size: 0x%X  Compressed: %v\n", i, frag.Start, size, compressed)
-	}
-
-	fmt.Println("\n--- Export Table ---")
-	for i, ref := range file.FileSystem.ExportTable.Refs {
-		fmt.Printf("  Inode %2d: block=0x%X  offset=0x%X  raw=0x%016X\n",
-			i+1, ref.BlockOffset, ref.IntraOffset, file.FileSystem.ExportTable.Raw[i])
-	}
-
-	fmt.Println("\n--- ID Table ---")
-	if file.FileSystem.IDTable != nil {
-		for i, id := range file.FileSystem.IDTable.IDs {
-			fmt.Printf("  [%d] ID: %d\n", i, id)
-		}
-	} else {
-		fmt.Println("  (not parsed)")
-	}
-
-	fmt.Println("\n--- Xattr Table ---")
-	if file.FileSystem.XattrTable != nil {
-		var prefixes = map[uint16]string{0: "user.", 1: "trusted.", 2: "security."}
-
-		fmt.Printf("  Xattr Table Start: 0x%X\n", file.FileSystem.XattrTable.IDTable.XattrTableStart)
-		fmt.Printf("  Xattr IDs:         %d\n", file.FileSystem.XattrTable.IDTable.XattrIds)
-
-		fmt.Println("\n  Lookup Table:")
-		for i, lookup := range file.FileSystem.XattrTable.LookupTable {
-			fmt.Printf("    [%d] XattrRef: 0x%016X  Count: %d  Size: %d\n",
-				i, lookup.XattrRef, lookup.Count, lookup.Size)
-		}
-
-		fmt.Println("\n  Entries:")
-		for i, entries := range file.FileSystem.XattrTable.Entries {
-			fmt.Printf("    Inode xattr set [%d]:\n", i)
-			for j, entry := range entries {
-				prefix := prefixes[entry.Key.Type&0xFF]
-				outOfLine := ""
-				if entry.OutOfLine {
-					outOfLine = " (out-of-line)"
-				}
-				fmt.Printf("      [%d] %s%s = %s%s\n",
-					j, prefix, entry.Key.Name, entry.Value.Value, outOfLine)
-			}
-		}
-	} else {
-		fmt.Println("  (not parsed)")
-	}
-}
-
 func main() {
+	//===========================================
+	//                 DAY 1
+	//===========================================
+	//
+	//I don't know go... BUT I can have AI help me and I have taught lots of programming so this shouldn't be
+	//too much of a hurdle.
+	//
+	//After note: AI Helped a lot with the small differences between languages where I know what I wanted in
+	//one language but not in go. Very fun language overall so far (Speaking from day 4)
+	//
+	//Only started 3 hours after the interview, so 8pm. Finished the day at 12am
+	//
+	//===========================================
+	//                 DAY 2
+	//===========================================
+	//
+	//Had School + Work so i had like 3 hours :/
+	//Lots of figuring out what everything outside the first few thousand bytes were
+	//Lots of tunnel visioning hence only finding SquashFS halfway through the day
+	//Then did research and organization to then have SquashFS docs and clean code for next day
+	//
+	//===========================================
+	//                 DAY 3
+	//===========================================
+	//
+	//Started the day at 5pm, AI was able to greatly speed up the reversing since I had the Squashfs docs.
+	//Then all I needed to do was read the docs, create the corresponding structs, and then have AI do some of the more
+	//menial refactoring for similar parts (saved me an hour)
+	//
+	//Finish Squashfs Parsing
+	//
+	//===========================================
+	//                 DAY 4
+	//===========================================
+	//
+	//Getting the files
+	//
+	//===========================================
+	//                 DAY 5
+	//===========================================
+	//
+	//Going back to the initial headers now that i know how it's actually structured from the
+	//experience from unpacking the other .pkg files.
+	//
+	//Live Start Header
+	//Backup Start Header
+	//Bootloader
+	//Kernel
+	//FileSystem
+	//
+	//Hopefully this should also be pretty easy like day 3 and kinda like day 4 since i already know the info,
+	//I just need to code it
+	//
+	//OOOOOOOO, this looks very applicable
+	//https://www.kernel.org/doc/html/v6.1/x86/boot.html#memory-layout
+
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: parser <path-to-firmware>")
 		os.Exit(1)
@@ -644,18 +340,6 @@ func main() {
 	defer mapped.Close()
 	data := mapped.Data()
 
-	// ===========================================
-	//                  DAY 1
-	// ===========================================
-
-	// I don't know go... BUT I can have AI help me and I have taught lots of programming so this shouldn't be
-	// too much of a hurdle.
-
-	// After note: AI Helped a lot with the small differences between languages where I know what I wanted in
-	// one language but not in go. Very fun language overall so far (Speaking from day 4)
-
-	// Only started 3 hours after the interview, so 8pm. Finished the day at 12am
-
 	// Where all the parsed results will live
 	file := FirmwareFile{
 		Live:    &LiveHeader{},
@@ -664,130 +348,6 @@ func main() {
 
 	file.Live = parseLiveHeader(data, 0x0)
 	file.Upgrade = parseUpgradeHeader(&file, data, uint64(file.Live.UpgradeHeader))
-
-	// ===========================================
-	//                  DAY 2
-	// ===========================================
-
-	// Had School + Work so i had like 3 hours :/
-	// Lots of figuring out what everything outside the first few thousand bytes were
-	// Lots of tunnel visioning hence only finding SquashFS halfway through the day
-	// Then did research and organization to then have SquashFS docs and clean code for next day
-
-	// ===========================================
-	//                  DAY 3
-	// ===========================================
-
-	// Started the day at 5pm, AI was able to greatly speed up the reversing since I had the Squashfs docs.
-	// Then all I needed to do was read the docs, create the corresponding structs, and then have AI do some of the more
-	// menial refactoring for similar parts (saved me an hour)
-
-	// Finish Squashfs Parsing
-
-	file.FileSystem, err = parseSquashFS(data, uint64(file.Live.FileSystemHeader))
-	if err != nil {
-		fmt.Printf("parseSquashFS error: %v\n", err)
-		os.Exit(1)
-	}
-
-	// ===========================================
-	//                  DAY 4
-	// ===========================================
-
-	// Getting the files
-
-	//fileOutputPath := filepath.Join(filepath.Dir(filePath), "output")
-	//if err := extractFiles(file.FileSystem, data, fileOutputPath); err != nil {
-	//	fmt.Printf("extractFiles error: %v\n", err)
-	//	os.Exit(1)
-	//}
-
-	// ==============================================
-
-	//mapped.Close()
-	//data = nil
-	//file.FileSystem = nil
-
-	//entries, err := os.ReadDir(fileOutputPath)
-	//if err != nil {
-	//	fmt.Printf("ReadDir error: %v\n", err)
-	//	os.Exit(1)
-	//}
-	//
-	//for _, entry := range entries {
-	//	if entry.IsDir() || filepath.Ext(entry.Name()) != ".pkg" {
-	//		continue
-	//	}
-	//	pkgPath := filepath.Join(fileOutputPath, entry.Name())
-	//	fmt.Printf("\n[Level 2] %s\n", entry.Name())
-	//
-	//	pkgMapped, err := openMapped(pkgPath)
-	//	fmt.Printf("\n[Level 2] %s\n", entry.Name())
-	//
-	//	pkgData := pkgMapped.Data()
-	//	if err != nil {
-	//		fmt.Printf("  WARNING: could not read %s: %v\n", entry.Name(), err)
-	//		continue
-	//	}
-	//
-	//	if uint64(len(pkgData)) < uint64(binary.Size(LiveHeader{})) {
-	//		fmt.Printf("  WARNING: %s too small for LiveHeader\n", entry.Name())
-	//		pkgMapped.Close()
-	//		continue
-	//	}
-	//
-	//	pkgStartHeader := fill[LiveHeader](pkgData, 0, binary.BigEndian)
-	//	pkgFSBase := uint64(pkgStartHeader.FileSystemHeader)
-	//
-	//	if pkgFSBase+4 > uint64(len(pkgData)) {
-	//		fmt.Printf("  WARNING: %s fsBase 0x%X out of bounds\n", entry.Name(), pkgFSBase)
-	//		pkgMapped.Close()
-	//		continue
-	//	}
-	//
-	//	if binary.LittleEndian.Uint32(pkgData[pkgFSBase:pkgFSBase+4]) != 0x73717368 {
-	//		fmt.Printf("  WARNING: %s no SquashFS magic at 0x%X\n", entry.Name(), pkgFSBase)
-	//		pkgMapped.Close()
-	//		continue
-	//	}
-	//
-	//	pkgSquash, err := parseSquashFS(pkgData, pkgFSBase)
-	//	if err != nil {
-	//		fmt.Printf("  WARNING: parseSquashFS failed for %s: %v\n", entry.Name(), err)
-	//		pkgMapped.Close()
-	//		continue
-	//	}
-	//
-	//	childOut := filepath.Join(fileOutputPath, entry.Name()+"_extracted")
-	//	if err := extractFiles(pkgSquash, pkgData, childOut); err != nil {
-	//		fmt.Printf("  WARNING: extractFiles failed for %s: %v\n", entry.Name(), err)
-	//	} else {
-	//		fmt.Printf("  Done -> %s\n", childOut)
-	//	}
-	//
-	//	pkgMapped.Close()
-	//	pkgData = nil
-	//	pkgSquash = nil
-	//}
-
-	// ===========================================
-	//                  DAY 5
-	// ===========================================
-
-	// Going back to the initial headers now that i know how it's actually structured from the
-	//experience from unpacking the other .pkg files.
-
-	// Live Start Header
-	// Backup Start Header
-	// Bootloader
-	// Kernel
-	// FileSystem
-
-	// Hopefully this should also be pretty easy like day 3 and kinda like day 4 since i already know the info,
-	// I just need to code it
-
-	// OOOOOOOO, this looks very applicable
-	// https://www.kernel.org/doc/html/v6.1/x86/boot.html#memory-layout
 
 	// An MBR is only 512 bytes long
 	mbrStart := uint64(file.Upgrade.MetaData.End)
@@ -798,8 +358,6 @@ func main() {
 		Header: fill[KernelHeader](data, kernelStart, binary.LittleEndian),
 		Data:   data[kernelStart+0x1F1+uint64(binary.Size(KernelHeader{})) : file.Live.UpgradeHeader+file.Upgrade.Initramfs],
 	}
-
-	printFirmwareFile(&file)
 
 	kernelPayloadStart := kernelStart + uint64(file.Kernel.Header.PayloadOffset)
 	kernelPayloadEnd := kernelPayloadStart + uint64(file.Kernel.Header.PayloadLength)
@@ -815,9 +373,83 @@ func main() {
 		End:   initramfsEnd,
 	}
 
-	initramfsOut := filepath.Join(filepath.Dir(filePath), "output")
-	if err := extractInitramfs(data, initramfsStart, initramfsEnd, initramfsOut); err != nil {
+	outputPath := filepath.Join(filepath.Dir(filePath), "output")
+
+	if err := extractInitramfs(data, initramfsStart, initramfsEnd, outputPath); err != nil {
 		fmt.Printf("extractInitramfs error: %v\n", err)
+	}
+
+	file.FileSystem, err = parseSquashFS(data, uint64(file.Live.FileSystemHeader))
+	if err != nil {
+		fmt.Printf("parseSquashFS error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := extractFiles(file.FileSystem, data, outputPath); err != nil {
+		fmt.Printf("extractFiles error: %v\n", err)
+		os.Exit(1)
+	}
+
+	mapped.Close()
+
+	entries, err := os.ReadDir(outputPath)
+	if err != nil {
+		fmt.Printf("ReadDir error: %v\n", err)
+		os.Exit(1)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".pkg" {
+			continue
+		}
+		pkgPath := filepath.Join(outputPath, entry.Name())
+		fmt.Printf("\n[Level 2] %s\n", entry.Name())
+
+		pkgMapped, err := openMapped(pkgPath)
+		fmt.Printf("\n[Level 2] %s\n", entry.Name())
+
+		pkgData := pkgMapped.Data()
+		if err != nil {
+			fmt.Printf("  WARNING: could not read %s: %v\n", entry.Name(), err)
+			continue
+		}
+
+		if uint64(len(pkgData)) < 0x8C { // uint64(binary.Size(LiveHeader{}), We added MetaData which has no fixed size so ...
+			fmt.Printf("  WARNING: %s too small for LiveHeader\n", entry.Name())
+			pkgMapped.Close()
+			continue
+		}
+
+		pkgStartHeader := parseLiveHeader(pkgData, 0)
+		pkgFSBase := uint64(pkgStartHeader.FileSystemHeader)
+
+		if pkgFSBase+4 > uint64(len(pkgData)) {
+			fmt.Printf("  WARNING: %s fsBase 0x%X out of bounds\n", entry.Name(), pkgFSBase)
+			pkgMapped.Close()
+			continue
+		}
+
+		if binary.LittleEndian.Uint32(pkgData[pkgFSBase:pkgFSBase+4]) != 0x73717368 {
+			fmt.Printf("  WARNING: %s no SquashFS magic at 0x%X\n", entry.Name(), pkgFSBase)
+			pkgMapped.Close()
+			continue
+		}
+
+		pkgSquash, err := parseSquashFS(pkgData, pkgFSBase)
+		if err != nil {
+			fmt.Printf("  WARNING: parseSquashFS failed for %s: %v\n", entry.Name(), err)
+			pkgMapped.Close()
+			continue
+		}
+
+		childOut := filepath.Join(outputPath, entry.Name()+"_extracted")
+		if err := extractFiles(pkgSquash, pkgData, childOut); err != nil {
+			fmt.Printf("  WARNING: extractFiles failed for %s: %v\n", entry.Name(), err)
+		} else {
+			fmt.Printf("  Done -> %s\n", childOut)
+		}
+
+		pkgMapped.Close()
 	}
 
 	regions := []struct {
@@ -839,4 +471,6 @@ func main() {
 		fmt.Printf("  %-25s [0x%08X - 0x%08X] (%d MB)\n",
 			r.name, r.start, r.end, (r.end-r.start)/1024/1024)
 	}
+
+	//printFirmwareFile(&file)
 }

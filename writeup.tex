@@ -49,7 +49,7 @@
 \rfoot{Page \thepage}
 
 \title{Firmware Image Analysis}
-\author{}
+\author{Jack Vega \\ \href{mailto:trackjackhere@gmail.com}{trackjackhere@gmail.com}}
 \date{March 2026}
 
 \begin{document}
@@ -97,7 +97,7 @@ The parser was written over approximately five days of part-time work. AI
       	signatures directly in hex before I eventually adopted binwalk
       	as well.
     
-	\item \textbf{Bouncing Ideas}, AI is useful for quickly sketching
+	\item \textbf{Bouncing ideas}, AI is useful for quickly sketching
       out a mockup to test a hypothesis, which significantly sped up
       working through theories about how the format is structured.
 
@@ -117,22 +117,31 @@ from:
 \end{itemize}
 
 % ==============================================================
+\newpage
 \section{Image Layout}
 
-Every byte in the image falls into one of the following regions. Exact
-offsets are read from the headers themselves, no hardcoded assumptions
-about layout are made.
+Every byte in the image falls into one of the following regions. Region
+boundaries are derived from header fields, with a fixed \texttt{0x8C}-byte
+header prefix used for the proprietary Live and Upgrade headers in the
+images analyzed.
 
-\begin{lstlisting}[style=hexstyle, basicstyle=\ttfamily\footnotesize]
-[0x00000000 			-> Live.UpgradeHeader]		Live Start Header + Metadata
-[Live.UpgradeHeader 	-> Upgrade.MetaData.End] 	Upgrade Header + Metadata
-[Upgrade.MetaData.End 	-> +0x200]            		Master Boot Record (512 bytes)
-[MBR end 				-> kernelPayloadStart] 		Kernel Setup Sectors
-[kernelPayloadStart 	-> kernelPayloadEnd]    	Kernel Payload (XZ vmlinux)
-[kernelPayloadEnd 		-> initramfsStart]        	Unknown / Padding
-[initramfsStart 		-> Live.FileSystemHeader]   Initramfs
-[Live.FileSystemHeader 	-> Live.FileEnd]     		SquashFS Filesystem
-\end{lstlisting}
+\begin{center}
+\small
+\begin{tabular}{l l l}
+\toprule
+\textbf{Start} & \textbf{End} & \textbf{Region} \\
+\midrule
+\texttt{0x00000000}          & \texttt{Live.UpgradeHeader}      & Live Start Header + Metadata \\
+\texttt{Live.UpgradeHeader}  & \texttt{Upgrade.MetaData.End}    & Upgrade Header + Metadata \\
+\texttt{Upgrade.MetaData.End}& \texttt{+0x200}                  & Master Boot Record (512 bytes) \\
+\texttt{MBR end}             & \texttt{kernelPayloadStart}      & Kernel Setup Sectors \\
+\texttt{kernelPayloadStart}  & \texttt{kernelPayloadEnd}        & Kernel Payload (XZ vmlinux) \\
+\texttt{kernelPayloadEnd}    & \texttt{initramfsStart}          & Kernel Early Boot Stub / Decompressor \\
+\texttt{initramfsStart}      & \texttt{Live.FileSystemHeader}   & Initramfs \\
+\texttt{Live.FileSystemHeader} & \texttt{Live.FileEnd}          & SquashFS Filesystem \\
+\bottomrule
+\end{tabular}
+\end{center}
 
 % ==============================================================
 \section{Region-by-Region Breakdown}
@@ -163,16 +172,20 @@ header that acts as the outermost envelope for the entire firmware image.
 \end{center}
 
 After the fixed fields, a \textbf{metadata block} begins at
-\texttt{0x8C} and extends to \texttt{UpgradeHeader}. This block uses a
+\texttt{0x8C} in the images analyzed and extends to
+\texttt{UpgradeHeader}. This block uses a
 TLV (Type-Length-Value) encoding with big-endian fields. It contains a
 standard TLV section followed by a compact TLV section (1-byte tags,
 2-byte lengths). The compact block ends with a 5-byte sentinel
 (\texttt{0C 00 01 41 EB}) immediately before the next structural region.
 
 The fields \texttt{UpgradeHeader}, \texttt{FileSystemHeader}, and
-\texttt{FileEnd} fully determine where every subsequent region begins. Because this header starts at 0x0, these positions are also absolute offsets unlike every other offset in the file.
+\texttt{FileEnd} anchor the major absolute regions of the image.
+Because this header starts at \texttt{0x0}, the parser treats these
+positions as absolute file offsets.
 
 % --------------------------------------------------------------
+\newpage
 \subsection{Upgrade Header}
 
 Located at the absolute offset stored in \texttt{Live.UpgradeHeader}.
@@ -197,8 +210,12 @@ Located at the absolute offset stored in \texttt{Live.UpgradeHeader}.
 \end{center}
 
 Like the Live header, this is followed by its own metadata block
-(TLV + compact TLV). The metadata block ends at
-\texttt{Upgrade.MetaData.End}. These two headers are called Live and Upgrade because i suspect that the first one is the Live one actively being used and the second one is the one that is used when upgrading, though this is not confirmed.
+(TLV + compact TLV) after the same fixed \texttt{0x8C}-byte header
+prefix used in the images analyzed. The metadata block ends at
+\texttt{Upgrade.MetaData.End}. These two headers are called Live 
+and Upgrade because I suspect that thefirst one is the Live one 
+actively being used and the second one is theone used when upgrading, 
+though this is not confirmed.
 
 % --------------------------------------------------------------
 \subsection{Master Boot Record}
@@ -229,6 +246,7 @@ Each of the four partition entries contains:
 \end{itemize}
 
 % --------------------------------------------------------------
+\newpage
 \subsection{Kernel Setup Sectors}
 
 The kernel image begins immediately after the MBR
@@ -245,15 +263,14 @@ kernel image. Relevant fields:
 \texttt{0x200} & Jump              & \texttt{EB xx} short jump \\
 \texttt{0x202} & Magic             & \texttt{HdrS} (\texttt{0x53726448}) \\
 \texttt{0x206} & Version           & Boot protocol version \\
-\texttt{0x248} & PayloadOffset     & Offset from setup end to compressed kernel \\
+\texttt{0x248} & PayloadOffset     & Offset from \texttt{kernelStart} to compressed kernel payload \\
 \texttt{0x24C} & PayloadLength     & Size of compressed kernel payload \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-The setup region ends at \((\texttt{setup\_sects} + 1) \times 512\) bytes
-from the kernel base. \texttt{PayloadOffset} is relative to that
-boundary.
+In the parser, \texttt{PayloadOffset} is applied relative to
+\texttt{kernelStart} when locating the compressed kernel payload.
 
 % --------------------------------------------------------------
 \subsection{Kernel Payload}
@@ -269,16 +286,16 @@ This region contains the XZ-compressed \texttt{vmlinux}. It can be
 decompressed independently if needed.
 
 % --------------------------------------------------------------
-\subsection{Unknown / Padding Region}
+\subsection{Kernel Boot Stub and Decompressor }
 
 \[
   [\,\texttt{kernelPayloadEnd},\;
-     \texttt{Live.UpgradeHeader} + \texttt{Upgrade.Initramfs}\,)
+     \texttt{Live.UpgradeHeader} + \texttt{Upgrade.Initramfs}\,]
 \]
 
-This region lies between the end of the kernel payload and the start of
-the initramfs. Its purpose was not fully determined, alignment padding
-or an additional bootloader artifact is suspected.
+This region contains the Linux kernel early boot stub and decompressor
+(x86-64 specific). It bridges the end of the compressed kernel payload
+and the start of the initramfs.
 
 % --------------------------------------------------------------
 \subsection{Initramfs}
@@ -330,17 +347,15 @@ The filesystem uses \textbf{XZ compression} (\texttt{CompressionID = 4}).
 \texttt{0x1E} & \texttt{uint16} & VersionMinor        & \\
 \texttt{0x20} & \texttt{uint64} & RootInodeRef        & Block + intra offset \\
 \texttt{0x28} & \texttt{uint64} & BytesUsed           & \\
-\texttt{0x30} & \texttt{uint64} & IDTableStart        & Absolute \\
-\texttt{0x38} & \texttt{uint64} & XattrIDTableStart   & Absolute \\
+\texttt{0x30} & \texttt{uint64} & IDTableStart        & Relative to SquashFS base \\
+\texttt{0x38} & \texttt{uint64} & XattrIDTableStart   & Relative to SquashFS base \\
 \texttt{0x40} & \texttt{uint64} & InodeTableStart     & Relative to SquashFS base \\
 \texttt{0x48} & \texttt{uint64} & DirectoryTableStart & Relative to SquashFS base \\
-\texttt{0x50} & \texttt{uint64} & FragmentTableStart  & Absolute \\
-\texttt{0x58} & \texttt{uint64} & ExportTableStart    & Absolute \\
+\texttt{0x50} & \texttt{uint64} & FragmentTableStart  & Relative to SquashFS base \\
+\texttt{0x58} & \texttt{uint64} & ExportTableStart    & Relative to SquashFS base \\
 \bottomrule
 \end{tabular}
 \end{center}
-
-All table start offsets are used directly to locate each table.
 
 % --------------------------------------------------------------
 \subsection{Metadata Blocks}
@@ -359,6 +374,7 @@ The \texttt{readSquashFSMetadataBlocks} function reads a contiguous range
 of these blocks and returns the fully decompressed byte stream.
 
 % --------------------------------------------------------------
+\newpage
 \subsection{Inode Table}
 
 Located between \texttt{InodeTableStart} and \texttt{DirectoryTableStart}
@@ -442,22 +458,23 @@ is stored in a \textbf{fragment block}. The fragment table is an indirect
 structure:
 
 \begin{enumerate}
-    \item \texttt{FragmentTableStart} points to a list of 8-byte absolute
-          pointers (one per metadata block of fragment entries).
+    \item \texttt{FragmentTableStart} points to a list of 8-byte offsets
+      relative to the SquashFS base (one per metadata block of fragment
+      entries).
     \item Each pointer references a metadata block containing
           \texttt{FragmentBlockEntry} structs:
 \end{enumerate}
 
 \begin{lstlisting}[style=gostyle]
 type FragmentBlockEntry struct {
-    Start  uint64  // absolute offset of compressed fragment block
+    Start  uint64  // offset of compressed fragment block relative to SquashFS base
     Size   uint32  // bit 24: uncompressed flag; bits 23-0: size
     Unused uint32
 }
 \end{lstlisting}
 
 To read a file's fragment tail: decompress the fragment block at
-\texttt{Fragments[FragmentBlockIndex].Start}, then read
+\texttt{SquashFS.Base + Fragments[FragmentBlockIndex].Start}, then read
 \texttt{remaining} bytes starting at \texttt{BlockOffset}.
 
 % --------------------------------------------------------------
@@ -486,9 +503,9 @@ A three-level structure:
 
 \begin{enumerate}
     \item \textbf{XattrIDTable} at \texttt{XattrIDTableStart}: contains
-          \texttt{XattrTableStart} (absolute pointer to key/value data),
-          \texttt{XattrIds} count, and a list of pointers to lookup
-          metadata blocks.
+      \texttt{XattrTableStart} (offset to key/value data relative to the
+      SquashFS base), \texttt{XattrIds} count, and a list of offsets to
+      lookup metadata blocks, also relative to the SquashFS base.
 
     \item \textbf{Lookup table}: array of 16-byte
           \texttt{XattrLookupTable} structs, one per xattr set.
@@ -534,12 +551,46 @@ Extraction walks every parsed inode. For each file inode:
 
 Symlinks are created with \texttt{os.Symlink}. Directories are created
 with \texttt{os.MkdirAll}. The \texttt{ParentMap} is built during
-directory parsing by matching each directory inode's
-\texttt{DirBlockStart} and \texttt{BlockOffset} against directory table
-entries.
+directory parsing by correlating directory inode location fields with
+directory table entries.
 
 % ==============================================================
-\section{What Remains Unexplained}
+\section{Deeper Binary Analysis}
+
+\subsection{Entropy Analysis}
+High entropy regions were observed in areas containing compressed data,
+consistent with the XZ-compressed SquashFS filesystem and the initramfs.
+Lower entropy was observed in the header regions and the MBR boot code.
+
+\subsection{Compression Identification}
+The initramfs was identified as a gzip-compressed CPIO archive via its
+magic bytes (\texttt{1F 8B}). The SquashFS payload uses XZ compression
+(\texttt{CompressionID = 4}). The kernel payload is also XZ-compressed,
+consistent with the Linux boot protocol \texttt{PayloadOffset} and
+\texttt{PayloadLength} fields.
+
+\subsection{Boot Stub Disassembly}
+The region between the kernel payload and the initramfs contains x86-64
+assembly code. This is the Linux early boot stub and decompressor, which
+is responsible for decompressing the kernel payload into memory before
+transferring control to the kernel entry point.
+
+\subsection{CPIO Archive}
+The initramfs was identified as a gzip-compressed CPIO archive
+(magic bytes \texttt{1F 8B}) and is written out by the parser as raw
+bytes to \texttt{initramfs.cpio}. It contains standard Unix directories
+(\texttt{bin}, \texttt{sbin}, \texttt{etc}, \texttt{lib},
+\texttt{lib64}, \texttt{usr}) alongside Cisco-specific scripts including
+\texttt{verify\_packages.sh}, \texttt{mount\_packages.sh}, and
+\texttt{explode-common}.
+
+% ==============================================================
+\section{Areas of Further Investigation}
+
+These regions were identified and located structurally, but their exact
+semantic purpose could not be determined within the time available. They
+do not represent gaps in the extraction, all bytes are accounted for
+positionally, but their meaning is not fully understood.
 
 \begin{itemize}
     \item \textbf{The 5-byte compact TLV sentinel}
@@ -548,15 +599,17 @@ entries.
           terminator; semantic meaning is unknown.
 
     \item \textbf{\texttt{Unknown} in both headers}: a 4-byte big-endian
-          value present in both Live and Upgrade headers. Possibly a size
+          value present in both Live and Upgrade headers. Possibly a version
           field.
 
-    \item \textbf{Region between kernel payload and initramfs}:
-          It is the Linux Kernel Early Boot Stub and Decompressor (specifically for x86-64).
-
     \item \textbf{Metadata block \texttt{BlockType} field}: parsed but not
-          interpreted, likely a version or type discriminator for the
-          proprietary header format.
+          interpreted.
+          
+    \item \textbf{Kernel Boot Stub and Decompressor}: Lots of different parts 
+      	  of the file point to the fact that this section is named this, but 
+          I haven't been able to parse it or find any offsets pointing to it 
+          to confirm my hypothesis.
+          
 \end{itemize}
 
 \end{document}

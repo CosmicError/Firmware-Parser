@@ -15,7 +15,7 @@ type SquashFS struct {
 	Base        uint64 // absolute offset into data[] where this SquashFS starts
 	Header      *SquashFSHeader
 	Inodes      []InodePair
-	InodeMap    map[uint32]*ExtendedFile
+	InodeMap    map[uint32]*ExtendedFile // Honestly in hindsight, probably shouldn't have limited this to just ExtendedFiles
 	Directories []DirectoryPair
 	NameMap     map[uint32]string
 	ParentMap   map[uint32]uint32
@@ -41,11 +41,16 @@ type SquashFSHeader struct {
 	RootInodeRef        uint64
 	BytesUsed           uint64
 	IDTableStart        uint64
-	XattrIDTableStart   uint64 // Absolute Position (Add SquashFS.Base)
-	InodeTableStart     uint64 // Relative Position
-	DirectoryTableStart uint64 // Relative Position
-	FragmentTableStart  uint64 // Absolute Position (Add SquashFS.Base)
-	ExportTableStart    uint64 // Absolute Position (Add SquashFS.Base)
+	XattrIDTableStart   uint64
+	InodeTableStart     uint64
+	DirectoryTableStart uint64
+	FragmentTableStart  uint64
+	ExportTableStart    uint64
+}
+
+type InodePair struct {
+	Header *InodeHeader
+	Body   interface{} // *ExtendedFile or *ExtendedDirectory etc
 }
 
 type InodeHeader struct {
@@ -57,15 +62,15 @@ type InodeHeader struct {
 	InodeNumber  uint32
 }
 
-type InodePair struct {
-	Header *InodeHeader
-	Body   interface{} // *ExtendedFile or *ExtendedDirectory etc
-}
-
-type DirectoryPair struct {
-	Header *DirectoryHeader
-	Index  *DirectoryIndex
-	Entry  []DirectoryEntry
+type ExtendedFile struct {
+	BlocksStart        uint64
+	FileSize           uint64
+	Sparse             uint64
+	HardLinkCount      uint32
+	FragmentBlockIndex uint32
+	BlockOffset        uint32
+	XattrIdx           uint32
+	BlockSizes         []uint32
 }
 
 type BasicFile struct {
@@ -97,17 +102,6 @@ type ExtendedSymlink struct {
 	XattrIdx      uint32
 }
 
-type ExtendedFile struct {
-	BlocksStart        uint64
-	FileSize           uint64
-	Sparse             uint64
-	HardLinkCount      uint32
-	FragmentBlockIndex uint32
-	BlockOffset        uint32
-	XattrIdx           uint32
-	BlockSizes         []uint32
-}
-
 type DirIndex struct {
 	Index    uint32
 	Start    uint32
@@ -126,10 +120,23 @@ type ExtendedDirectory struct {
 	Index             []DirIndex
 }
 
+type DirectoryPair struct {
+	Header *DirectoryHeader
+	Index  *DirectoryIndex
+	Entry  []DirectoryEntry
+}
+
 type DirectoryHeader struct {
 	Count       uint32
 	Start       uint32
 	InodeNumber uint32
+}
+
+type DirectoryIndex struct {
+	Index    uint32
+	Start    uint32
+	NameSize uint32
+	Name     []uint8
 }
 
 type DirectoryEntry struct {
@@ -140,22 +147,10 @@ type DirectoryEntry struct {
 	Name        []uint8
 }
 
-type DirectoryIndex struct {
-	Index    uint32
-	Start    uint32
-	NameSize uint32
-	Name     []uint8
-}
-
 type FragmentBlockEntry struct {
 	Start  uint64
 	Size   uint32
 	Unused uint32
-}
-
-type InodeRef struct {
-	BlockOffset uint32 // offset from SquashFSHeader.InodeTableStart to the metadata block (2 byte header included)
-	IntraOffset uint16 // offset within the decompressed metadata block
 }
 
 type ExportTable struct {
@@ -163,8 +158,38 @@ type ExportTable struct {
 	Refs []InodeRef
 }
 
+type InodeRef struct {
+	BlockOffset uint32 // offset from SquashFSHeader.InodeTableStart to the metadata block (2 byte header included)
+	IntraOffset uint16 // offset within the decompressed metadata block
+}
+
 type IDTable struct {
 	IDs []uint32
+}
+
+type XattrTable struct {
+	IDTable     XattrIDTable
+	LookupTable []XattrLookupTable
+	Entries     [][]XattrEntry // outer index = lookup table index, inner = key/value pairs for that inode
+}
+
+type XattrIDTable struct {
+	XattrTableStart uint64
+	XattrIds        uint32
+	Unused          uint32 // Not used
+	Table           []uint64
+}
+
+type XattrLookupTable struct {
+	XattrRef uint64
+	Count    uint32
+	Size     uint32
+}
+
+type XattrEntry struct {
+	Key       XattrKeyEntry
+	Value     XattrValueEntry
+	OutOfLine bool // true if type had 0x0100 flag set
 }
 
 type XattrKeyEntry struct {
@@ -176,31 +201,6 @@ type XattrKeyEntry struct {
 type XattrValueEntry struct {
 	ValueSize uint32
 	Value     []uint8 // ValueSize as the length
-}
-
-type XattrEntry struct {
-	Key       XattrKeyEntry
-	Value     XattrValueEntry
-	OutOfLine bool // true if type had 0x0100 flag set
-}
-
-type XattrLookupTable struct {
-	XattrRef uint64
-	Count    uint32
-	Size     uint32
-}
-
-type XattrIDTable struct {
-	XattrTableStart uint64 // The absolute position of the first metadata block holding the key/value pairs.
-	XattrIds        uint32
-	Unused          uint32   // Not used
-	Table           []uint64 // Stores absolute locations of each metadata block of the XattrLookupTable
-}
-
-type XattrTable struct {
-	IDTable     XattrIDTable
-	LookupTable []XattrLookupTable
-	Entries     [][]XattrEntry // outer index = lookup table index, inner = key/value pairs for that inode
 }
 
 func readSquashFSMetadataBlocks(start uint64, end uint64, data []byte) []byte {
