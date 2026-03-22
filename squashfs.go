@@ -226,7 +226,7 @@ func readSquashFSMetadataBlocks(start uint64, end uint64, data []byte) []byte {
 		offset += 2
 
 		if dataSize == 0 || offset+dataSize > uint64(len(data)) {
-			fmt.Printf("  [meta] bad block: dataSize=0x%X at offset=0x%X\n", dataSize, offset-2)
+			//fmt.Printf("  [meta] bad block: dataSize=0x%X at offset=0x%X\n", dataSize, offset-2)
 			break
 		}
 
@@ -665,11 +665,11 @@ func decodeXattrTable(squash *SquashFS, data []byte, xattrTableStart uint64) {
 		})
 	}
 
-	fmt.Printf("  [xattr] XattrTableStart=0x%X Table[0]=0x%X xattrTableStart=0x%X\n",
-		xattrIDTable.XattrTableStart,
-		xattrIDTable.Table[0],
-		xattrTableStart,
-	)
+	//fmt.Printf("  [xattr] XattrTableStart=0x%X Table[0]=0x%X xattrTableStart=0x%X\n",
+	//	xattrIDTable.XattrTableStart,
+	//	xattrIDTable.Table[0],
+	//	xattrTableStart,
+	//)
 
 	kvData := readSquashFSMetadataBlocks(
 		xattrIDTable.XattrTableStart,
@@ -1026,29 +1026,29 @@ func parseSquashFS(data []byte, fsBase uint64) (*SquashFS, error) {
 
 	squash.Header = fill[SquashFSHeader](data, squash.Base, binary.LittleEndian)
 
-	fmt.Printf("  [sqfs raw] InodeTableStart=0x%X DirTableStart=0x%X FragTableStart=0x%X\n",
-		squash.Header.InodeTableStart,
-		squash.Header.DirectoryTableStart,
-		squash.Header.FragmentTableStart,
-	)
-	fmt.Printf("  [sqfs raw] ExportTableStart=0x%X IDTableStart=0x%X XattrTableStart=0x%X\n",
-		squash.Header.ExportTableStart,
-		squash.Header.IDTableStart,
-		squash.Header.XattrIDTableStart,
-	)
-	fmt.Printf("  [sqfs raw] base=0x%X dataLen=0x%X\n",
-		squash.Base, uint64(len(data)),
-	)
-
-	fmt.Printf("  [sqfs header] base=0x%X compression=%d flags=0x%04X inodes=%d\n",
-		squash.Base,
-		squash.Header.CompressionID,
-		squash.Header.Flags,
-		squash.Header.InodeCount,
-	)
-	fmt.Printf("  [sqfs tables] inodeTable=0x%X dirTable=0x%X fragTable=0x%X\n",
-		squash.Header.InodeTableStart, squash.Header.DirectoryTableStart, squash.Header.FragmentTableStart,
-	)
+	//fmt.Printf("  [sqfs raw] InodeTableStart=0x%X DirTableStart=0x%X FragTableStart=0x%X\n",
+	//	squash.Header.InodeTableStart,
+	//	squash.Header.DirectoryTableStart,
+	//	squash.Header.FragmentTableStart,
+	//)
+	//fmt.Printf("  [sqfs raw] ExportTableStart=0x%X IDTableStart=0x%X XattrTableStart=0x%X\n",
+	//	squash.Header.ExportTableStart,
+	//	squash.Header.IDTableStart,
+	//	squash.Header.XattrIDTableStart,
+	//)
+	//fmt.Printf("  [sqfs raw] base=0x%X dataLen=0x%X\n",
+	//	squash.Base, uint64(len(data)),
+	//)
+	//
+	//fmt.Printf("  [sqfs header] base=0x%X compression=%d flags=0x%04X inodes=%d\n",
+	//	squash.Base,
+	//	squash.Header.CompressionID,
+	//	squash.Header.Flags,
+	//	squash.Header.InodeCount,
+	//)
+	//fmt.Printf("  [sqfs tables] inodeTable=0x%X dirTable=0x%X fragTable=0x%X\n",
+	//	squash.Header.InodeTableStart, squash.Header.DirectoryTableStart, squash.Header.FragmentTableStart,
+	//)
 
 	if squash.Header.Magic != 0x73717368 {
 		return nil, fmt.Errorf("not a squashfs image at 0x%X (magic=0x%08X)",
@@ -1061,10 +1061,6 @@ func parseSquashFS(data []byte, fsBase uint64) (*SquashFS, error) {
 	exportTableStart := squash.Base + squash.Header.ExportTableStart
 	idTableStart := squash.Base + squash.Header.IDTableStart
 	xattrTableStart := squash.Base + squash.Header.XattrIDTableStart
-
-	//fragBlockOffset := binary.LittleEndian.Uint64(data[fragTableStart:fragTableStart+8]) + squash.Base
-	//fragBlockHeader := binary.LittleEndian.Uint16(data[fragBlockOffset : fragBlockOffset+2])
-	//fragBlockSize := uint64(fragBlockHeader & 0x7FFF)
 
 	fragPtrCount := int(squash.Header.FragmentEntryCount+511) / 512
 	var fragBlockOffsets []uint64
@@ -1130,14 +1126,8 @@ func parseSquashFS(data []byte, fsBase uint64) (*SquashFS, error) {
 		idData = append(idData, readSquashFSMetadataBlocks(ptr, end, data)...)
 	}
 
-	//exportBlockOffset := binary.LittleEndian.Uint64(data[exportTableStart:exportTableStart+8]) + squash.Base
-	//idBlockOffset := binary.LittleEndian.Uint64(data[idTableStart:idTableStart+8]) + squash.Base
-
 	inodeData := readSquashFSMetadataBlocks(inodeTableStart, dirTableStart, data)
 	dirData := readSquashFSMetadataBlocks(dirTableStart, fragTableStart, data)
-	//fragData := readSquashFSMetadataBlocks(fragBlockOffset, fragBlockOffset+2+fragBlockSize, data) // Something is wrong? I didn;t change this like i changed export and id
-	//exportData := readSquashFSMetadataBlocks(exportBlockOffset, idTableStart, data)
-	//idData := readSquashFSMetadataBlocks(idBlockOffset, xattrTableStart, data)
 
 	decodeInodes(squash, inodeData)
 
